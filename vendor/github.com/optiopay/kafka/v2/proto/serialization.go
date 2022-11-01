@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"reflect"
 	"time"
 )
 
@@ -27,6 +26,10 @@ func NewDecoder(r io.Reader) *decoder {
 		r:   r,
 		buf: make([]byte, 1024),
 	}
+}
+
+func (d *decoder) SetReader(r io.Reader) {
+	d.r = r
 }
 
 func (d *decoder) DecodeInt8() int8 {
@@ -153,16 +156,15 @@ func (d *decoder) DecodeString() string {
 	return string(b)
 }
 
-func (d *decoder) DecodeArrayLen(nullable bool) (int, error) {
+func (d *decoder) DecodeArrayLen() (int, error) {
 	len := int(d.DecodeInt32())
 
-	if len < 0 {
-		if nullable { // null array.
-			return -1, nil
-		} else {
-			return 0, ErrInvalidArrayLen
-		}
-	} else if len > maxParseBufSize {
+	// Sometime kafka may send -1 as size of array.
+	if len == -1 {
+		return 0, nil
+	}
+
+	if len > maxParseBufSize {
 		return 0, ErrInvalidArrayLen
 	}
 
@@ -198,6 +200,80 @@ func (d *decoder) DecodeBytes() []byte {
 	return b
 }
 
+func (d *decoder) DecodeVarInt() int64 {
+	// err already stored by ReadByte():
+	res, _ := binary.ReadVarint(d)
+	return res
+}
+
+// ReadByte implements ByteReader
+func (d *decoder) ReadByte() (byte, error) {
+	_, err := io.ReadFull(d.r, d.buf[:1])
+	if err != nil {
+		d.err = err
+	}
+	return d.buf[0], err
+}
+
+func (d *decoder) DecodeVarBytes() []byte {
+	slen := d.DecodeVarInt()
+
+	if slen < 1 {
+		return nil
+	}
+
+	b, err := allocParseBuf(int(slen))
+	if err != nil {
+		d.err = err
+		return nil
+	}
+	n, err := io.ReadFull(d.r, b)
+	if err != nil {
+		d.err = err
+		return nil
+	}
+	if n != int(slen) {
+		d.err = ErrNotEnoughData
+		return nil
+	}
+	return b
+}
+
+func (d *decoder) DecodeVarString() string {
+	if d.err != nil {
+		return ""
+	}
+	slen := d.DecodeVarInt()
+	if d.err != nil {
+		return ""
+	}
+	if slen < 1 {
+		return ""
+	}
+
+	var b []byte
+	if int(slen) > len(d.buf) {
+		var err error
+		b, err = allocParseBuf(int(slen))
+		if err != nil {
+			d.err = err
+			return ""
+		}
+	} else {
+		b = d.buf[:int(slen)]
+	}
+	n, err := io.ReadFull(d.r, b)
+	if err != nil {
+		d.err = err
+		return ""
+	}
+	if n != int(slen) {
+		d.err = ErrNotEnoughData
+		return ""
+	}
+	return string(b)
+}
+
 func (d *decoder) Err() error {
 	return d.err
 }
@@ -212,72 +288,15 @@ func NewEncoder(w io.Writer) *encoder {
 	return &encoder{w: w}
 }
 
-func (e *encoder) Encode(value interface{}) {
+func (e *encoder) EncodeDuration(val time.Duration) {
 	if e.err != nil {
 		return
 	}
-	var b []byte
 
-	switch val := value.(type) {
-	case int8:
-		_, e.err = e.w.Write([]byte{byte(val)})
-	case int16:
-		b = e.buf[:2]
-		binary.BigEndian.PutUint16(b, uint16(val))
-	case int32:
-		b = e.buf[:4]
-		binary.BigEndian.PutUint32(b, uint32(val))
-	case int64:
-		b = e.buf[:8]
-		binary.BigEndian.PutUint64(b, uint64(val))
-	case uint16:
-		b = e.buf[:2]
-		binary.BigEndian.PutUint16(b, val)
-	case uint32:
-		b = e.buf[:4]
-		binary.BigEndian.PutUint32(b, val)
-	case uint64:
-		b = e.buf[:8]
-		binary.BigEndian.PutUint64(b, val)
-	case string:
-		buf := e.buf[:2]
-		binary.BigEndian.PutUint16(buf, uint16(len(val)))
-		e.err = writeAll(e.w, buf)
-		if e.err == nil {
-			e.err = writeAll(e.w, []byte(val))
-		}
-	case []byte:
-		buf := e.buf[:4]
-
-		if val == nil {
-			no := int32(-1)
-			binary.BigEndian.PutUint32(buf, uint32(no))
-			e.err = writeAll(e.w, buf)
-			return
-		}
-
-		binary.BigEndian.PutUint32(buf, uint32(len(val)))
-		e.err = writeAll(e.w, buf)
-		if e.err == nil {
-			e.err = writeAll(e.w, val)
-		}
-	case []int32:
-		e.EncodeArrayLen(val)
-		for _, v := range val {
-			e.Encode(v)
-		}
-	case time.Duration:
-		intVal := uint32(val / time.Millisecond)
-		b = e.buf[:4]
-		binary.BigEndian.PutUint32(b, intVal)
-	default:
-		e.err = fmt.Errorf("cannot encode type %T", value)
-	}
-
-	if b != nil {
-		e.err = writeAll(e.w, b)
-		return
-	}
+	intVal := uint32(val / time.Millisecond)
+	b := e.buf[:4]
+	binary.BigEndian.PutUint32(b, intVal)
+	_, e.err = e.w.Write(b)
 }
 
 func (e *encoder) EncodeInt8(val int8) {
@@ -285,7 +304,9 @@ func (e *encoder) EncodeInt8(val int8) {
 		return
 	}
 
-	_, e.err = e.w.Write([]byte{byte(val)})
+	b := e.buf[:1]
+	b[0] = byte(val)
+	_, e.err = e.w.Write(b)
 }
 
 func (e *encoder) EncodeInt16(val int16) {
@@ -308,6 +329,17 @@ func (e *encoder) EncodeInt32(val int32) {
 	e.err = writeAll(e.w, b)
 }
 
+func (e *encoder) EncodeInt32s(val []int32) {
+	if e.err != nil {
+		return
+	}
+
+	e.EncodeArrayLen(len(val))
+	for _, v := range val {
+		e.EncodeInt32(v)
+	}
+}
+
 func (e *encoder) EncodeInt64(val int64) {
 	if e.err != nil {
 		return
@@ -316,6 +348,17 @@ func (e *encoder) EncodeInt64(val int64) {
 	b := e.buf[:8]
 	binary.BigEndian.PutUint64(b, uint64(val))
 	e.err = writeAll(e.w, b)
+}
+
+func (e *encoder) EncodeInt64s(val []int64) {
+	if e.err != nil {
+		return
+	}
+
+	e.EncodeArrayLen(len(val))
+	for _, v := range val {
+		e.EncodeInt64(v)
+	}
 }
 
 func (e *encoder) EncodeUint32(val uint32) {
@@ -380,16 +423,8 @@ func (e *encoder) EncodeError(err error) {
 	e.err = writeAll(e.w, b)
 }
 
-func (e *encoder) EncodeArrayLen(s interface{}) {
-	v := reflect.ValueOf(s)
-	if v.Type().Kind() != reflect.Slice {
-		panic(fmt.Sprintf("EncodeArraylen called with a non-slice argument: %v", s))
-	}
-	if v.IsNil() {
-		e.EncodeInt32(-1)
-	} else {
-		e.EncodeInt32(int32(v.Len()))
-	}
+func (e *encoder) EncodeArrayLen(length int) {
+	e.EncodeInt32(int32(length))
 }
 
 func (e *encoder) Err() error {

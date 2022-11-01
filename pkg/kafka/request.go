@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/optiopay/kafka/proto"
+	"github.com/optiopay/kafka/v2/proto"
 	"github.com/sirupsen/logrus"
 
 	"github.com/cilium/cilium/pkg/flowdebug"

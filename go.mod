@@ -59,7 +59,7 @@ require (
 	github.com/mitchellh/mapstructure v1.5.0
 	github.com/onsi/ginkgo v1.16.5
 	github.com/onsi/gomega v1.22.1
-	github.com/optiopay/kafka v0.0.0-00010101000000-000000000000
+	github.com/optiopay/kafka/v2 v2.1.1
 	github.com/osrg/gobgp/v3 v3.5.0
 	github.com/pmezard/go-difflib v1.0.0
 	github.com/prometheus/client_golang v1.13.0

@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/optiopay/kafka/proto"
+	"github.com/optiopay/kafka/v2/proto"
 	. "gopkg.in/check.v1"
 
 	"github.com/cilium/cilium/pkg/policy/api/kafka"

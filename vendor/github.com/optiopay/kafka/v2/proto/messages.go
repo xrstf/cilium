@@ -1,10 +1,12 @@
 package proto
 
 import (
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"io/ioutil"
@@ -15,8 +17,7 @@ import (
 
 /*
 
-Kafka wire protocol implemented as described in
-https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-Messagesets
+Kafka wire protocol implemented as described in http://kafka.apache.org/protocol.html
 
 */
 
@@ -37,6 +38,11 @@ const (
 	OffsetCommitReqKind     = 8
 	OffsetFetchReqKind      = 9
 	ConsumerMetadataReqKind = 10
+	APIVersionsReqKind      = 18
+	CreateTopicsReqKind     = 19
+)
+
+const (
 
 	// receive the latest offset (i.e. the offset of the next coming message)
 	OffsetReqTimeLatest = -1
@@ -57,6 +63,72 @@ const (
 	// response.
 	RequiredAcksLocal = 1
 )
+
+type Request interface {
+	Kind() int16
+	GetHeader() *RequestHeader
+	GetVersion() int16
+	GetCorrelationID() int32
+	GetClientID() string
+	SetClientID(cliendID string)
+	io.WriterTo
+	Bytes() ([]byte, error)
+}
+
+var _ Request = &ProduceReq{}
+var _ Request = &FetchReq{}
+var _ Request = &OffsetReq{}
+var _ Request = &MetadataReq{}
+var _ Request = &OffsetCommitReq{}
+var _ Request = &OffsetFetchReq{}
+var _ Request = &ConsumerMetadataReq{}
+var _ Request = &APIVersionsReq{}
+var _ Request = &CreateTopicsReq{}
+
+func SetVersion(header *RequestHeader, version int16) {
+	header.version = version
+}
+
+func SetCorrelationID(header *RequestHeader, correlationID int32) {
+	header.correlationID = correlationID
+}
+
+type RequestHeader struct {
+	version       int16
+	correlationID int32
+	ClientID      string
+}
+
+func (h *RequestHeader) GetHeader() *RequestHeader {
+	return h
+}
+
+func (h *RequestHeader) GetVersion() int16 {
+	return h.version
+}
+
+func (h *RequestHeader) GetCorrelationID() int32 {
+	return h.correlationID
+}
+
+func (h *RequestHeader) GetClientID() string {
+	return h.ClientID
+}
+
+func (h *RequestHeader) SetClientID(cliendID string) {
+	h.ClientID = cliendID
+}
+
+var SupportedByDriver = map[int16]SupportedVersion{
+	ProduceReqKind:          SupportedVersion{MinVersion: KafkaV0, MaxVersion: KafkaV2},
+	FetchReqKind:            SupportedVersion{MinVersion: KafkaV0, MaxVersion: KafkaV5},
+	OffsetReqKind:           SupportedVersion{MinVersion: KafkaV0, MaxVersion: KafkaV2},
+	MetadataReqKind:         SupportedVersion{MinVersion: KafkaV0, MaxVersion: KafkaV5},
+	OffsetCommitReqKind:     SupportedVersion{MinVersion: KafkaV0, MaxVersion: KafkaV3},
+	OffsetFetchReqKind:      SupportedVersion{MinVersion: KafkaV0, MaxVersion: KafkaV3},
+	ConsumerMetadataReqKind: SupportedVersion{MinVersion: KafkaV0, MaxVersion: KafkaV1},
+	APIVersionsReqKind:      SupportedVersion{MinVersion: KafkaV0, MaxVersion: KafkaV1},
+}
 
 type Compression int8
 
@@ -98,52 +170,18 @@ func boolToInt8(val bool) int8 {
 	return res
 }
 
-// discard tries to discard bytes
-// from the io.Reader in chunks of maxDiscardSize(4096) bytes
-// to avoid allocating huge amount of memory in
-// one go.
-func discard(r io.Reader, n int32) {
-	remBytes := n
-	var delBytes int32
-
-	delBytes = 0
-	for remBytes > 0 {
-		if remBytes > maxDiscardSize {
-			delBytes = maxDiscardSize
-			remBytes = remBytes - maxDiscardSize
-		} else {
-			delBytes = remBytes
-			remBytes = 0
-		}
-		io.CopyN(ioutil.Discard, r, int64(delBytes))
-	}
-}
-
 // ReadReq returns request kind ID and byte representation of the whole message
 // in wire protocol format.
 func ReadReq(r io.Reader) (requestKind int16, b []byte, err error) {
 	dec := NewDecoder(r)
 	msgSize := dec.DecodeInt32()
-	if err := dec.Err(); err != nil {
-		return 0, nil, err
-	}
-
-	if msgSize <= 0 {
-		return 0, nil, io.ErrUnexpectedEOF
-	}
-
 	requestKind = dec.DecodeInt16()
 	if err := dec.Err(); err != nil {
-		discard(r, msgSize)
 		return 0, nil, err
 	}
 	// size of the message + size of the message itself
 	b, err = allocParseBuf(int(msgSize + 4))
 	if err != nil {
-		if msgSize > 2 {
-			// We have already read the requestKind
-			discard(r, msgSize-2)
-		}
 		return 0, nil, err
 	}
 
@@ -172,26 +210,13 @@ func ReadReq(r io.Reader) (requestKind int16, b []byte, err error) {
 func ReadResp(r io.Reader) (correlationID int32, b []byte, err error) {
 	dec := NewDecoder(r)
 	msgSize := dec.DecodeInt32()
-	if err := dec.Err(); err != nil {
-		return 0, nil, err
-	}
-
-	if msgSize <= 0 {
-		return 0, nil, io.ErrUnexpectedEOF
-	}
-
 	correlationID = dec.DecodeInt32()
 	if err := dec.Err(); err != nil {
-		discard(r, msgSize)
 		return 0, nil, err
 	}
 	// size of the message + size of the message itself
 	b, err = allocParseBuf(int(msgSize + 4))
 	if err != nil {
-		if msgSize > 4 {
-			// We have already read the correlationID
-			discard(r, msgSize-4)
-		}
 		return 0, nil, err
 	}
 
@@ -226,15 +251,9 @@ func ComputeCrc(m *Message, compression Compression) uint32 {
 // writeMessageSet writes a Message Set into w.
 // It returns the number of bytes written and any error.
 func writeMessageSet(w io.Writer, messages []*Message, compression Compression) (int, error) {
-	// The RECORDS type is nullable.
-	if messages == nil {
-		return -1, nil
-	}
-
 	if len(messages) == 0 {
 		return 0, nil
 	}
-
 	// NOTE(caleb): it doesn't appear to be documented, but I observed that the
 	// Java client sets the offset of the synthesized message set for a group of
 	// compressed messages to be the offset of the last message in the set.
@@ -353,24 +372,126 @@ func (w *slicewriter) Slice() []byte {
 	return w.buf[:w.pos]
 }
 
+// readRecordBatch reasd and return record batch from the stream
+// RecordBatch replace MessageSet for kafka >= 0.11
+
+// Because kafka is sending message set directly from the drive, it might cut
+// off part of the last message. This also means that the last message can be
+// shorter than the header is saying. In such case just ignore the last
+// malformed message from the set and returned earlier data.
+func readRecordBatch(r io.Reader) (*RecordBatch, error) {
+	dec := NewDecoder(r)
+
+	rb := &RecordBatch{}
+	rb.FirstOffset = dec.DecodeInt64()
+	rb.Length = dec.DecodeInt32()
+	rb.PartitionLeaderEpoch = dec.DecodeInt32()
+
+	// Magic byte. It represents a version of a message.
+	// But we've already determinated that this is a record batch
+	// and since there is only one version of record batch exists, we can just ignore it.
+	_ = dec.DecodeInt8()
+
+	rb.CRC = dec.DecodeInt32()
+
+	crc := crc32.New(crc32.MakeTable(crc32.Castagnoli))
+	r = io.TeeReader(r, crc)
+	dec.SetReader(r)
+
+	rb.Attributes = dec.DecodeInt16()
+	rb.LastOffsetDelta = dec.DecodeInt32()
+
+	rb.FirstTimestamp = dec.DecodeInt64()
+	rb.MaxTimestamp = dec.DecodeInt64()
+	rb.ProducerId = dec.DecodeInt64()
+	rb.ProducerEpoch = dec.DecodeInt16()
+	rb.FirstSequence = dec.DecodeInt32()
+
+	slen, err := dec.DecodeArrayLen()
+	if err != nil {
+		return nil, err
+	}
+
+	switch rb.Compression() {
+	case CompressionNone:
+		break
+	case CompressionGzip:
+		r, err = gzip.NewReader(r)
+		if err != nil {
+			return nil, err
+		}
+		allUnzipped, err := ioutil.ReadAll(r)
+		if err != nil {
+			return nil, err
+		}
+		r = bytes.NewReader(allUnzipped)
+		dec.SetReader(r)
+
+	case CompressionSnappy:
+		var err error
+		val, err := ioutil.ReadAll(r)
+		if err != nil {
+			return nil, err
+		}
+		decoded, err := snappyDecode(val)
+		if err != nil {
+			return nil, err
+		}
+		r = bytes.NewReader(decoded)
+		dec.SetReader(r)
+	default:
+		return nil, errors.New("Unknown compression")
+	}
+
+	if dec.Err() != nil {
+		return nil, dec.Err()
+	}
+
+	rb.Records = make([]*Record, 0, slen)
+
+	for i := 0; i < slen; i++ {
+		rec, err := readRecord(dec)
+		if err != nil {
+			return nil, err
+		}
+		rb.Records = append(rb.Records, rec)
+	}
+	if uint32(rb.CRC) != crc.Sum32() {
+		return nil, fmt.Errorf("Wrong CRC32")
+	}
+	return rb, nil
+}
+
+func readRecord(dec *decoder) (*Record, error) {
+	rec := &Record{}
+	rec.Length = dec.DecodeVarInt()
+	rec.Attributes = dec.DecodeInt8()
+	rec.TimestampDelta = dec.DecodeVarInt()
+	rec.OffsetDelta = dec.DecodeVarInt()
+
+	rec.Key = dec.DecodeVarBytes()
+	rec.Value = dec.DecodeVarBytes()
+
+	headersLen := dec.DecodeVarInt()
+
+	rec.Headers = make([]RecordHeader, headersLen)
+	for i := range rec.Headers {
+		rec.Headers[i].Key = dec.DecodeVarString()
+		rec.Headers[i].Value = dec.DecodeVarBytes()
+	}
+	return rec, dec.Err()
+}
+
 // readMessageSet reads and return messages from the stream.
 // The size is known before a message set is decoded.
 // Because kafka is sending message set directly from the drive, it might cut
 // off part of the last message. This also means that the last message can be
 // shorter than the header is saying. In such case just ignore the last
 // malformed message from the set and returned earlier data.
-// The version refers to the kafka version used for the requests and responses.
-func readMessageSet(r io.Reader, size int32, version int16) ([]*Message, error) {
-	// The RECORDS type is nullable.
-	if size < 0 { // null array
-		return nil, nil
-	}
-
-	if size > maxParseBufSize {
+func readMessageSet(r io.Reader, size int32) ([]*Message, error) {
+	if size < 0 || size > maxParseBufSize {
 		return nil, messageSizeError(int(size))
 	}
-
-	rd := io.LimitReader(r, int64(size))
 
 	if conf.SimplifiedMessageSetParsing {
 		msgbuf, err := allocParseBuf(int(size))
@@ -378,13 +499,13 @@ func readMessageSet(r io.Reader, size int32, version int16) ([]*Message, error) 
 			return nil, err
 		}
 
-		if _, err := io.ReadFull(rd, msgbuf); err != nil {
+		if _, err := io.ReadFull(r, msgbuf); err != nil {
 			return nil, err
 		}
 		return make([]*Message, 0, 0), nil
 	}
 
-	dec := NewDecoder(rd)
+	dec := NewDecoder(r)
 	set := make([]*Message, 0, 256)
 
 	for {
@@ -414,7 +535,7 @@ func readMessageSet(r io.Reader, size int32, version int16) ([]*Message, error) 
 			return nil, err
 		}
 
-		if _, err := io.ReadFull(rd, msgbuf); err != nil {
+		if _, err := io.ReadFull(r, msgbuf); err != nil {
 			if err == io.EOF || err == io.ErrUnexpectedEOF {
 				return set, nil
 			}
@@ -440,11 +561,11 @@ func readMessageSet(r io.Reader, size int32, version int16) ([]*Message, error) 
 		}
 
 		// magic byte
-		_ = msgdec.DecodeInt8()
+		messageVersion := MessageVersion(msgdec.DecodeInt8())
 
 		attributes := msgdec.DecodeInt8()
 
-		if version >= KafkaV1 {
+		if messageVersion == MessageV1 {
 			// timestamp
 			_ = msgdec.DecodeInt64()
 		}
@@ -482,7 +603,7 @@ func readMessageSet(r io.Reader, size int32, version int16) ([]*Message, error) 
 					return nil, err
 				}
 			}
-			msgs, err := readMessageSet(bytes.NewReader(decoded), int32(len(decoded)), version)
+			msgs, err := readMessageSet(bytes.NewReader(decoded), int32(len(decoded)))
 			if err != nil {
 				return nil, err
 			}
@@ -493,10 +614,27 @@ func readMessageSet(r io.Reader, size int32, version int16) ([]*Message, error) 
 	}
 }
 
+func encodeHeader(e *encoder, r Request) {
+	// message size - for now just placeholder
+	e.EncodeInt32(0)
+	e.EncodeInt16(r.Kind())
+	e.EncodeInt16(r.GetVersion())
+	e.EncodeInt32(r.GetCorrelationID())
+	e.EncodeString(r.GetClientID())
+}
+
+func decodeHeader(dec *decoder, req Request) {
+	// total message size
+	_ = dec.DecodeInt32()
+	// api key
+	_ = dec.DecodeInt16()
+	SetVersion(req.GetHeader(), dec.DecodeInt16())
+	SetCorrelationID(req.GetHeader(), dec.DecodeInt32())
+	req.SetClientID(dec.DecodeString())
+}
+
 type MetadataReq struct {
-	Version                int16
-	CorrelationID          int32
-	ClientID               string
+	RequestHeader
 	Topics                 []string
 	AllowAutoTopicCreation bool // >= KafkaV4 only
 }
@@ -505,28 +643,19 @@ func ReadMetadataReq(r io.Reader) (*MetadataReq, error) {
 	var req MetadataReq
 	dec := NewDecoder(r)
 
-	// total message size
-	_ = dec.DecodeInt32()
-	// api key
-	_ = dec.DecodeInt16()
-	req.Version = dec.DecodeInt16()
-	req.CorrelationID = dec.DecodeInt32()
-	req.ClientID = dec.DecodeString()
-	len, err := dec.DecodeArrayLen(true) // nullable
+	decodeHeader(dec, &req)
+
+	len, err := dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
-	if len < 0 { // null array
-		req.Topics = nil
-	} else {
-		req.Topics = make([]string, len)
-	}
+	req.Topics = make([]string, len)
 
 	for i := range req.Topics {
 		req.Topics[i] = dec.DecodeString()
 	}
 
-	if req.Version >= KafkaV4 {
+	if req.version >= KafkaV4 {
 		req.AllowAutoTopicCreation = dec.DecodeInt8() != 0
 	}
 
@@ -536,24 +665,31 @@ func ReadMetadataReq(r io.Reader) (*MetadataReq, error) {
 	return &req, nil
 }
 
-func (r *MetadataReq) Bytes(version int16) ([]byte, error) {
+func (r MetadataReq) Kind() int16 {
+	return MetadataReqKind
+}
+
+func (r *MetadataReq) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
 
-	// message size - for now just placeholder
-	enc.Encode(int32(0))
-	enc.Encode(int16(MetadataReqKind))
-	enc.Encode(r.Version)
-	enc.Encode(r.CorrelationID)
-	enc.Encode(r.ClientID)
+	encodeHeader(enc, r)
 
-	enc.EncodeArrayLen(r.Topics)
+	if len(r.Topics) == 0 {
+		if r.version >= 1 {
+			enc.EncodeArrayLen(-1)
+		} else {
+			enc.EncodeArrayLen(0)
+		}
+	} else {
+		enc.EncodeArrayLen(len(r.Topics))
+	}
 	for _, name := range r.Topics {
-		enc.Encode(name)
+		enc.EncodeString(name)
 	}
 
-	if version >= KafkaV4 {
-		enc.Encode(boolToInt8(r.AllowAutoTopicCreation))
+	if r.version >= KafkaV4 {
+		enc.EncodeInt8(boolToInt8(r.AllowAutoTopicCreation))
 	}
 
 	if enc.Err() != nil {
@@ -567,8 +703,8 @@ func (r *MetadataReq) Bytes(version int16) ([]byte, error) {
 	return b, nil
 }
 
-func (r *MetadataReq) WriteTo(w io.Writer, version int16) (int64, error) {
-	b, err := r.Bytes(version)
+func (r *MetadataReq) WriteTo(w io.Writer) (int64, error) {
+	b, err := r.Bytes()
 	if err != nil {
 		return 0, err
 	}
@@ -577,6 +713,7 @@ func (r *MetadataReq) WriteTo(w io.Writer, version int16) (int64, error) {
 }
 
 type MetadataResp struct {
+	Version       int16
 	CorrelationID int32
 	ThrottleTime  time.Duration // >= KafkaV3
 	Brokers       []MetadataRespBroker
@@ -600,60 +737,64 @@ type MetadataRespTopic struct {
 }
 
 type MetadataRespPartition struct {
-	Err      error
-	ID       int32
-	Leader   int32
-	Replicas []int32
-	Isrs     []int32
+	Err             error
+	ID              int32
+	Leader          int32
+	Replicas        []int32
+	Isrs            []int32
+	OfflineReplicas []int32
 }
 
-func (r *MetadataResp) Bytes(version int16) ([]byte, error) {
+func (r *MetadataResp) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
 
 	// message size - for now just placeholder
-	enc.Encode(int32(0))
-	enc.Encode(r.CorrelationID)
+	enc.EncodeInt32(0)
+	enc.EncodeInt32(r.CorrelationID)
 
-	if version >= KafkaV3 {
-		enc.Encode(r.ThrottleTime)
+	if r.Version >= KafkaV3 {
+		enc.EncodeDuration(r.ThrottleTime)
 	}
 
-	enc.EncodeArrayLen(r.Brokers)
+	enc.EncodeArrayLen(len(r.Brokers))
 	for _, broker := range r.Brokers {
-		enc.Encode(broker.NodeID)
-		enc.Encode(broker.Host)
-		enc.Encode(broker.Port)
+		enc.EncodeInt32(broker.NodeID)
+		enc.EncodeString(broker.Host)
+		enc.EncodeInt32(broker.Port)
 
-		if version >= KafkaV1 {
-			enc.Encode(broker.Rack)
+		if r.Version >= KafkaV1 {
+			enc.EncodeString(broker.Rack)
 		}
 	}
 
-	if version >= KafkaV2 {
-		enc.Encode(r.ClusterID)
+	if r.Version >= KafkaV2 {
+		enc.EncodeString(r.ClusterID)
 	}
 
-	if version >= KafkaV1 {
-		enc.Encode(r.ControllerID)
+	if r.Version >= KafkaV1 {
+		enc.EncodeInt32(r.ControllerID)
 	}
 
-	enc.EncodeArrayLen(r.Topics)
+	enc.EncodeArrayLen(len(r.Topics))
 	for _, topic := range r.Topics {
 		enc.EncodeError(topic.Err)
-		enc.Encode(topic.Name)
+		enc.EncodeString(topic.Name)
 
-		if version >= KafkaV1 {
-			enc.Encode(boolToInt8(topic.IsInternal))
+		if r.Version >= KafkaV1 {
+			enc.EncodeInt8(boolToInt8(topic.IsInternal))
 		}
 
-		enc.EncodeArrayLen(topic.Partitions)
+		enc.EncodeArrayLen(len(topic.Partitions))
 		for _, part := range topic.Partitions {
 			enc.EncodeError(part.Err)
-			enc.Encode(part.ID)
-			enc.Encode(part.Leader)
-			enc.Encode(part.Replicas)
-			enc.Encode(part.Isrs)
+			enc.EncodeInt32(part.ID)
+			enc.EncodeInt32(part.Leader)
+			enc.EncodeInt32s(part.Replicas)
+			enc.EncodeInt32s(part.Isrs)
+			if r.Version >= KafkaV5 {
+				enc.EncodeInt32s(part.OfflineReplicas)
+			}
 		}
 	}
 
@@ -669,14 +810,23 @@ func (r *MetadataResp) Bytes(version int16) ([]byte, error) {
 }
 
 func ReadMetadataResp(r io.Reader) (*MetadataResp, error) {
+	return ReadVersionedMetadataResp(r, KafkaV0)
+}
+
+func ReadVersionedMetadataResp(r io.Reader, version int16) (*MetadataResp, error) {
 	var resp MetadataResp
+	resp.Version = version
 	dec := NewDecoder(r)
 
 	// total message size
 	_ = dec.DecodeInt32()
 	resp.CorrelationID = dec.DecodeInt32()
 
-	len, err := dec.DecodeArrayLen(false)
+	if resp.Version >= KafkaV3 {
+		resp.ThrottleTime = dec.DecodeDuration32()
+	}
+
+	len, err := dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
@@ -687,9 +837,20 @@ func ReadMetadataResp(r io.Reader) (*MetadataResp, error) {
 		b.NodeID = dec.DecodeInt32()
 		b.Host = dec.DecodeString()
 		b.Port = dec.DecodeInt32()
+		if resp.Version >= KafkaV1 {
+			b.Rack = dec.DecodeString()
+		}
 	}
 
-	len, err = dec.DecodeArrayLen(false)
+	if resp.Version >= KafkaV2 {
+		resp.ClusterID = dec.DecodeString()
+	}
+
+	if resp.Version >= KafkaV1 {
+		resp.ControllerID = dec.DecodeInt32()
+	}
+
+	len, err = dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
@@ -699,7 +860,12 @@ func ReadMetadataResp(r io.Reader) (*MetadataResp, error) {
 		var t = &resp.Topics[ti]
 		t.Err = errFromNo(dec.DecodeInt16())
 		t.Name = dec.DecodeString()
-		len, err = dec.DecodeArrayLen(false)
+
+		if resp.Version >= KafkaV1 {
+			t.IsInternal = (dec.DecodeInt8() == 1)
+		}
+
+		len, err = dec.DecodeArrayLen()
 		if err != nil {
 			return nil, err
 		}
@@ -711,7 +877,7 @@ func ReadMetadataResp(r io.Reader) (*MetadataResp, error) {
 			p.ID = dec.DecodeInt32()
 			p.Leader = dec.DecodeInt32()
 
-			len, err = dec.DecodeArrayLen(false)
+			len, err = dec.DecodeArrayLen()
 			if err != nil {
 				return nil, err
 			}
@@ -721,7 +887,7 @@ func ReadMetadataResp(r io.Reader) (*MetadataResp, error) {
 				p.Replicas[ri] = dec.DecodeInt32()
 			}
 
-			len, err = dec.DecodeArrayLen(false)
+			len, err = dec.DecodeArrayLen()
 			if err != nil {
 				return nil, err
 			}
@@ -729,6 +895,18 @@ func ReadMetadataResp(r io.Reader) (*MetadataResp, error) {
 
 			for ii := range p.Isrs {
 				p.Isrs[ii] = dec.DecodeInt32()
+			}
+
+			if resp.Version >= KafkaV5 {
+				len, err = dec.DecodeArrayLen()
+				if err != nil {
+					return nil, err
+				}
+				p.OfflineReplicas = make([]int32, len)
+
+				for ii := range p.OfflineReplicas {
+					p.OfflineReplicas[ii] = dec.DecodeInt32()
+				}
 			}
 		}
 	}
@@ -740,9 +918,7 @@ func ReadMetadataResp(r io.Reader) (*MetadataResp, error) {
 }
 
 type FetchReq struct {
-	Version        int16
-	CorrelationID  int32
-	ClientID       string
+	RequestHeader
 	ReplicaID      int32
 	MaxWaitTime    time.Duration
 	MinBytes       int32
@@ -768,27 +944,21 @@ func ReadFetchReq(r io.Reader) (*FetchReq, error) {
 	var req FetchReq
 	dec := NewDecoder(r)
 
-	// total message size
-	_ = dec.DecodeInt32()
-	// api key
-	_ = dec.DecodeInt16()
-	req.Version = dec.DecodeInt16()
-	req.CorrelationID = dec.DecodeInt32()
-	req.ClientID = dec.DecodeString()
+	decodeHeader(dec, &req)
 
 	req.ReplicaID = dec.DecodeInt32()
 	req.MaxWaitTime = dec.DecodeDuration32()
 	req.MinBytes = dec.DecodeInt32()
 
-	if req.Version >= KafkaV3 {
+	if req.version >= KafkaV3 {
 		req.MaxBytes = dec.DecodeInt32()
 	}
 
-	if req.Version >= KafkaV4 {
+	if req.version >= KafkaV4 {
 		req.IsolationLevel = dec.DecodeInt8()
 	}
 
-	len, err := dec.DecodeArrayLen(false)
+	len, err := dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
@@ -798,7 +968,7 @@ func ReadFetchReq(r io.Reader) (*FetchReq, error) {
 		var topic = &req.Topics[ti]
 		topic.Name = dec.DecodeString()
 
-		len, err = dec.DecodeArrayLen(false)
+		len, err = dec.DecodeArrayLen()
 		if err != nil {
 			return nil, err
 		}
@@ -809,7 +979,7 @@ func ReadFetchReq(r io.Reader) (*FetchReq, error) {
 			part.ID = dec.DecodeInt32()
 			part.FetchOffset = dec.DecodeInt64()
 
-			if req.Version >= KafkaV5 {
+			if req.version >= KafkaV5 {
 				part.LogStartOffset = dec.DecodeInt64()
 			}
 
@@ -823,42 +993,43 @@ func ReadFetchReq(r io.Reader) (*FetchReq, error) {
 	return &req, nil
 }
 
-func (r *FetchReq) Bytes(version int16) ([]byte, error) {
+func (r FetchReq) Kind() int16 {
+	return FetchReqKind
+}
+
+func (r *FetchReq) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
 
-	// message size - for now just placeholder
-	enc.Encode(int32(0))
-	enc.Encode(int16(FetchReqKind))
-	enc.Encode(r.Version)
-	enc.Encode(r.CorrelationID)
-	enc.Encode(r.ClientID)
+	encodeHeader(enc, r)
 
-	enc.Encode(r.ReplicaID)
-	enc.Encode(r.MaxWaitTime)
-	enc.Encode(r.MinBytes)
+	//enc.Encode(r.ReplicaID)
+	enc.EncodeInt32(-1)
 
-	if version >= KafkaV3 {
-		enc.Encode(r.MaxBytes)
+	enc.EncodeDuration(r.MaxWaitTime)
+	enc.EncodeInt32(r.MinBytes)
+
+	if r.version >= KafkaV3 {
+		enc.EncodeInt32(r.MaxBytes)
 	}
 
-	if version >= KafkaV4 {
-		enc.Encode(r.IsolationLevel)
+	if r.version >= KafkaV4 {
+		enc.EncodeInt8(r.IsolationLevel)
 	}
 
-	enc.EncodeArrayLen(r.Topics)
+	enc.EncodeArrayLen(len(r.Topics))
 	for _, topic := range r.Topics {
-		enc.Encode(topic.Name)
-		enc.EncodeArrayLen(topic.Partitions)
+		enc.EncodeString(topic.Name)
+		enc.EncodeArrayLen(len(topic.Partitions))
 		for _, part := range topic.Partitions {
-			enc.Encode(part.ID)
-			enc.Encode(part.FetchOffset)
+			enc.EncodeInt32(part.ID)
+			enc.EncodeInt64(part.FetchOffset)
 
-			if version >= KafkaV5 {
-				enc.Encode(part.LogStartOffset)
+			if r.version >= KafkaV5 {
+				enc.EncodeInt64(part.LogStartOffset)
 			}
 
-			enc.Encode(part.MaxBytes)
+			enc.EncodeInt32(part.MaxBytes)
 		}
 	}
 
@@ -873,8 +1044,8 @@ func (r *FetchReq) Bytes(version int16) ([]byte, error) {
 	return b, nil
 }
 
-func (r *FetchReq) WriteTo(w io.Writer, version int16) (int64, error) {
-	b, err := r.Bytes(version)
+func (r *FetchReq) WriteTo(w io.Writer) (int64, error) {
+	b, err := r.Bytes()
 	if err != nil {
 		return 0, err
 	}
@@ -883,6 +1054,7 @@ func (r *FetchReq) WriteTo(w io.Writer, version int16) (int64, error) {
 }
 
 type FetchResp struct {
+	Version       int16
 	CorrelationID int32
 	ThrottleTime  time.Duration
 	Topics        []FetchRespTopic
@@ -893,6 +1065,17 @@ type FetchRespTopic struct {
 	Partitions []FetchRespPartition
 }
 
+// Message version define which format of messages
+// is using in this particular Produce/Response
+// MessageV0  and MessageV1 indicate usage of MessageSet
+// MessageV3 indicate usage of RecordBatch
+// See https://cwiki.apache.org/confluence/display/KAFKA/A+Guide+To+The+Kafka+Protocol#AGuideToTheKafkaProtocol-Messagesets
+type MessageVersion int8
+
+const MessageV0 MessageVersion = 0
+const MessageV1 MessageVersion = 1
+const MessageV2 MessageVersion = 2
+
 type FetchRespPartition struct {
 	ID                  int32
 	Err                 error
@@ -901,6 +1084,8 @@ type FetchRespPartition struct {
 	LogStartOffset      int64
 	AbortedTransactions []FetchRespAbortedTransaction
 	Messages            []*Message
+	MessageVersion      MessageVersion
+	RecordBatches       []*RecordBatch
 }
 
 type FetchRespAbortedTransaction struct {
@@ -908,42 +1093,77 @@ type FetchRespAbortedTransaction struct {
 	FirstOffset int64
 }
 
-func (r *FetchResp) Bytes(version int16) ([]byte, error) {
+type RecordBatch struct {
+	FirstOffset          int64
+	Length               int32
+	PartitionLeaderEpoch int32
+	Magic                int8
+	CRC                  int32
+	Attributes           int16
+	LastOffsetDelta      int32
+	FirstTimestamp       int64
+	MaxTimestamp         int64
+	ProducerId           int64
+	ProducerEpoch        int16
+	FirstSequence        int32
+	Records              []*Record
+}
+
+type Record struct {
+	Length         int64
+	Attributes     int8
+	TimestampDelta int64
+	OffsetDelta    int64
+	Key            []byte
+	Value          []byte
+	Headers        []RecordHeader
+}
+
+type RecordHeader struct {
+	Key   string
+	Value []byte
+}
+
+func (rb *RecordBatch) Compression() Compression {
+	return Compression(rb.Attributes & 3)
+}
+
+func (r *FetchResp) Bytes() ([]byte, error) {
 	var buf buffer
 	enc := NewEncoder(&buf)
 
-	enc.Encode(int32(0)) // placeholder
-	enc.Encode(r.CorrelationID)
+	enc.EncodeInt32(0) // placeholder
+	enc.EncodeInt32(r.CorrelationID)
 
-	if version >= KafkaV1 {
-		enc.Encode(r.ThrottleTime)
+	if r.Version >= KafkaV1 {
+		enc.EncodeDuration(r.ThrottleTime)
 	}
 
-	enc.EncodeArrayLen(r.Topics)
+	enc.EncodeArrayLen(len(r.Topics))
 	for _, topic := range r.Topics {
-		enc.Encode(topic.Name)
-		enc.EncodeArrayLen(topic.Partitions)
+		enc.EncodeString(topic.Name)
+		enc.EncodeArrayLen(len(topic.Partitions))
 		for _, part := range topic.Partitions {
-			enc.Encode(part.ID)
+			enc.EncodeInt32(part.ID)
 			enc.EncodeError(part.Err)
-			enc.Encode(part.TipOffset)
+			enc.EncodeInt64(part.TipOffset)
 
-			if version >= KafkaV4 {
-				enc.Encode(part.LastStableOffset)
+			if r.Version >= KafkaV4 {
+				enc.EncodeInt64(part.LastStableOffset)
 
-				if version >= KafkaV5 {
-					enc.Encode(part.LogStartOffset)
+				if r.Version >= KafkaV5 {
+					enc.EncodeInt64(part.LogStartOffset)
 				}
 
-				enc.EncodeArrayLen(part.AbortedTransactions)
+				enc.EncodeArrayLen(len(part.AbortedTransactions))
 				for _, trans := range part.AbortedTransactions {
-					enc.Encode(trans.ProducerID)
-					enc.Encode(trans.FirstOffset)
+					enc.EncodeInt64(trans.ProducerID)
+					enc.EncodeInt64(trans.FirstOffset)
 				}
 			}
 
 			i := len(buf)
-			enc.Encode(int32(0)) // placeholder
+			enc.EncodeInt32(0) // placeholder
 			// NOTE(caleb): writing compressed fetch response isn't implemented
 			// for now, since that's not needed for clients.
 			n, err := writeMessageSet(&buf, part.Messages, CompressionNone)
@@ -963,8 +1183,14 @@ func (r *FetchResp) Bytes(version int16) ([]byte, error) {
 }
 
 func ReadFetchResp(r io.Reader) (*FetchResp, error) {
+	return ReadVersionedFetchResp(r, KafkaV0)
+}
+
+func ReadVersionedFetchResp(r io.Reader, version int16) (*FetchResp, error) {
 	var err error
 	var resp FetchResp
+
+	resp.Version = version
 
 	dec := NewDecoder(r)
 
@@ -972,27 +1198,48 @@ func ReadFetchResp(r io.Reader) (*FetchResp, error) {
 	_ = dec.DecodeInt32()
 	resp.CorrelationID = dec.DecodeInt32()
 
-	len, err := dec.DecodeArrayLen(false)
+	if resp.Version >= KafkaV1 {
+		resp.ThrottleTime = dec.DecodeDuration32()
+	}
+
+	numTopics, err := dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
-	resp.Topics = make([]FetchRespTopic, len)
+	resp.Topics = make([]FetchRespTopic, numTopics)
 
 	for ti := range resp.Topics {
 		var topic = &resp.Topics[ti]
 		topic.Name = dec.DecodeString()
 
-		len, err := dec.DecodeArrayLen(false)
+		numPartitions, err := dec.DecodeArrayLen()
 		if err != nil {
 			return nil, err
 		}
-		topic.Partitions = make([]FetchRespPartition, len)
+		topic.Partitions = make([]FetchRespPartition, numPartitions)
 
 		for pi := range topic.Partitions {
 			var part = &topic.Partitions[pi]
 			part.ID = dec.DecodeInt32()
 			part.Err = errFromNo(dec.DecodeInt16())
 			part.TipOffset = dec.DecodeInt64()
+
+			if resp.Version >= KafkaV4 {
+				part.LastStableOffset = dec.DecodeInt64()
+				if resp.Version >= KafkaV5 {
+					part.LogStartOffset = dec.DecodeInt64()
+				}
+				numAbortedTransactions, err := dec.DecodeArrayLen()
+				if err != nil {
+					return nil, err
+				}
+				part.AbortedTransactions = make([]FetchRespAbortedTransaction, numAbortedTransactions)
+				for i := range part.AbortedTransactions {
+					part.AbortedTransactions[i].ProducerID = dec.DecodeInt64()
+					part.AbortedTransactions[i].FirstOffset = dec.DecodeInt64()
+				}
+			}
+
 			if dec.Err() != nil {
 				return nil, dec.Err()
 			}
@@ -1000,13 +1247,43 @@ func ReadFetchResp(r io.Reader) (*FetchResp, error) {
 			if dec.Err() != nil {
 				return nil, dec.Err()
 			}
-			if part.Messages, err = readMessageSet(r, msgSetSize, 0); err != nil {
-				return nil, err
-			}
-			for _, msg := range part.Messages {
-				msg.Topic = topic.Name
-				msg.Partition = part.ID
-				msg.TipOffset = part.TipOffset
+
+			br := bufio.NewReader(io.LimitReader(r, int64(msgSetSize)))
+			for {
+				// try to figure out what is next - MessageSet or RecordBatch
+				b, err := br.Peek(17)
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					return nil, err
+				}
+				part.MessageVersion = MessageVersion(int8(b[16]))
+
+				if part.MessageVersion < MessageV2 {
+					// Response contains MessageSet
+					if part.Messages, err = readMessageSet(br, msgSetSize); err != nil {
+						return nil, err
+					}
+					for _, msg := range part.Messages {
+						msg.Topic = topic.Name
+						msg.Partition = part.ID
+						msg.TipOffset = part.TipOffset
+					}
+				} else if part.MessageVersion == MessageV2 {
+					// Response contains RecordBatch
+					batch, err := readRecordBatch(br)
+					if (err == ErrNotEnoughData || err == io.EOF || err == io.ErrUnexpectedEOF) && len(part.RecordBatches) > 0 {
+						// it was partial batch so we just ignore it
+						break
+					}
+					if err != nil {
+						return nil, err
+					}
+					part.RecordBatches = append(part.RecordBatches, batch)
+				} else {
+					return nil, errors.New("Incorrect message byte")
+				}
 			}
 		}
 	}
@@ -1023,9 +1300,7 @@ const (
 )
 
 type ConsumerMetadataReq struct {
-	Version         int16
-	CorrelationID   int32
-	ClientID        string
+	RequestHeader
 	ConsumerGroup   string
 	CoordinatorType int8 // >= KafkaV1
 }
@@ -1034,16 +1309,11 @@ func ReadConsumerMetadataReq(r io.Reader) (*ConsumerMetadataReq, error) {
 	var req ConsumerMetadataReq
 	dec := NewDecoder(r)
 
-	// total message size
-	_ = dec.DecodeInt32()
-	// api key
-	_ = dec.DecodeInt16()
-	req.Version = dec.DecodeInt16()
-	req.CorrelationID = dec.DecodeInt32()
-	req.ClientID = dec.DecodeString()
+	decodeHeader(dec, &req)
+
 	req.ConsumerGroup = dec.DecodeString()
 
-	if req.Version >= KafkaV1 {
+	if req.version >= KafkaV1 {
 		req.CoordinatorType = dec.DecodeInt8()
 	}
 
@@ -1053,18 +1323,17 @@ func ReadConsumerMetadataReq(r io.Reader) (*ConsumerMetadataReq, error) {
 	return &req, nil
 }
 
-func (r *ConsumerMetadataReq) Bytes(version int16) ([]byte, error) {
+func (r ConsumerMetadataReq) Kind() int16 {
+	return ConsumerMetadataReqKind
+}
+
+func (r *ConsumerMetadataReq) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
 
-	// message size - for now just placeholder
-	enc.Encode(int32(0))
-	enc.Encode(int16(ConsumerMetadataReqKind))
-	enc.Encode(r.Version)
-	enc.Encode(r.CorrelationID)
-	enc.Encode(r.ClientID)
+	encodeHeader(enc, r)
 
-	enc.Encode(r.ConsumerGroup)
+	enc.EncodeString(r.ConsumerGroup)
 
 	if enc.Err() != nil {
 		return nil, enc.Err()
@@ -1077,8 +1346,8 @@ func (r *ConsumerMetadataReq) Bytes(version int16) ([]byte, error) {
 	return b, nil
 }
 
-func (r *ConsumerMetadataReq) WriteTo(w io.Writer, version int16) (int64, error) {
-	b, err := r.Bytes(version)
+func (r *ConsumerMetadataReq) WriteTo(w io.Writer) (int64, error) {
+	b, err := r.Bytes()
 	if err != nil {
 		return 0, err
 	}
@@ -1087,6 +1356,7 @@ func (r *ConsumerMetadataReq) WriteTo(w io.Writer, version int16) (int64, error)
 }
 
 type ConsumerMetadataResp struct {
+	Version         int16
 	CorrelationID   int32
 	ThrottleTime    time.Duration // >= KafkaV1
 	Err             error
@@ -1097,13 +1367,26 @@ type ConsumerMetadataResp struct {
 }
 
 func ReadConsumerMetadataResp(r io.Reader) (*ConsumerMetadataResp, error) {
+	return ReadVersionedConsumerMetadataResp(r, KafkaV0)
+}
+
+func ReadVersionedConsumerMetadataResp(r io.Reader, version int16) (*ConsumerMetadataResp, error) {
 	var resp ConsumerMetadataResp
+	resp.Version = version
 	dec := NewDecoder(r)
 
 	// total message size
 	_ = dec.DecodeInt32()
 	resp.CorrelationID = dec.DecodeInt32()
+
+	if version >= KafkaV1 {
+		resp.ThrottleTime = dec.DecodeDuration32()
+	}
+
 	resp.Err = errFromNo(dec.DecodeInt16())
+	if version >= KafkaV1 {
+		resp.ErrMsg = dec.DecodeString()
+	}
 	resp.CoordinatorID = dec.DecodeInt32()
 	resp.CoordinatorHost = dec.DecodeString()
 	resp.CoordinatorPort = dec.DecodeInt32()
@@ -1114,27 +1397,27 @@ func ReadConsumerMetadataResp(r io.Reader) (*ConsumerMetadataResp, error) {
 	return &resp, nil
 }
 
-func (r *ConsumerMetadataResp) Bytes(version int16) ([]byte, error) {
+func (r *ConsumerMetadataResp) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
 
 	// message size - for now just placeholder
-	enc.Encode(int32(0))
-	enc.Encode(r.CorrelationID)
+	enc.EncodeInt32(0)
+	enc.EncodeInt32(r.CorrelationID)
 
-	if version >= KafkaV1 {
-		enc.Encode(r.ThrottleTime)
+	if r.Version >= KafkaV1 {
+		enc.EncodeDuration(r.ThrottleTime)
 	}
 
 	enc.EncodeError(r.Err)
 
-	if version >= KafkaV1 {
-		enc.Encode(r.ErrMsg)
+	if r.Version >= KafkaV1 {
+		enc.EncodeString(r.ErrMsg)
 	}
 
-	enc.Encode(r.CoordinatorID)
-	enc.Encode(r.CoordinatorHost)
-	enc.Encode(r.CoordinatorPort)
+	enc.EncodeInt32(r.CoordinatorID)
+	enc.EncodeString(r.CoordinatorHost)
+	enc.EncodeInt32(r.CoordinatorPort)
 
 	if enc.Err() != nil {
 		return nil, enc.Err()
@@ -1148,9 +1431,7 @@ func (r *ConsumerMetadataResp) Bytes(version int16) ([]byte, error) {
 }
 
 type OffsetCommitReq struct {
-	Version           int16
-	CorrelationID     int32
-	ClientID          string
+	RequestHeader
 	ConsumerGroup     string
 	GroupGenerationID int32  // >= KafkaV1 only
 	MemberID          string // >= KafkaV1 only
@@ -1174,25 +1455,20 @@ func ReadOffsetCommitReq(r io.Reader) (*OffsetCommitReq, error) {
 	var req OffsetCommitReq
 	dec := NewDecoder(r)
 
-	// total message size
-	_ = dec.DecodeInt32()
-	// api key
-	_ = dec.DecodeInt16()
-	req.Version = dec.DecodeInt16()
-	req.CorrelationID = dec.DecodeInt32()
-	req.ClientID = dec.DecodeString()
+	decodeHeader(dec, &req)
+
 	req.ConsumerGroup = dec.DecodeString()
 
-	if req.Version >= KafkaV1 {
+	if req.version >= KafkaV1 {
 		req.GroupGenerationID = dec.DecodeInt32()
 		req.MemberID = dec.DecodeString()
 	}
 
-	if req.Version >= KafkaV2 {
+	if req.version >= KafkaV2 {
 		req.RetentionTime = dec.DecodeInt64()
 	}
 
-	len, err := dec.DecodeArrayLen(false)
+	len, err := dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
@@ -1202,7 +1478,7 @@ func ReadOffsetCommitReq(r io.Reader) (*OffsetCommitReq, error) {
 		var topic = &req.Topics[ti]
 		topic.Name = dec.DecodeString()
 
-		len, err := dec.DecodeArrayLen(false)
+		len, err := dec.DecodeArrayLen()
 		if err != nil {
 			return nil, err
 		}
@@ -1213,7 +1489,7 @@ func ReadOffsetCommitReq(r io.Reader) (*OffsetCommitReq, error) {
 			part.ID = dec.DecodeInt32()
 			part.Offset = dec.DecodeInt64()
 
-			if req.Version == KafkaV1 {
+			if req.version == KafkaV1 {
 				part.TimeStamp = time.Unix(0, dec.DecodeInt64()*int64(time.Millisecond))
 			}
 
@@ -1227,42 +1503,41 @@ func ReadOffsetCommitReq(r io.Reader) (*OffsetCommitReq, error) {
 	return &req, nil
 }
 
-func (r *OffsetCommitReq) Bytes(version int16) ([]byte, error) {
+func (r OffsetCommitReq) Kind() int16 {
+	return OffsetCommitReqKind
+}
+
+func (r *OffsetCommitReq) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
 
-	// message size - for now just placeholder
-	enc.Encode(int32(0))
-	enc.Encode(int16(OffsetCommitReqKind))
-	enc.Encode(r.Version)
-	enc.Encode(r.CorrelationID)
-	enc.Encode(r.ClientID)
+	encodeHeader(enc, r)
 
-	enc.Encode(r.ConsumerGroup)
+	enc.EncodeString(r.ConsumerGroup)
 
-	if version >= KafkaV1 {
-		enc.Encode(r.GroupGenerationID)
-		enc.Encode(r.MemberID)
+	if r.version >= KafkaV1 {
+		enc.EncodeInt32(r.GroupGenerationID)
+		enc.EncodeString(r.MemberID)
 	}
 
-	if version >= KafkaV2 {
-		enc.Encode(r.RetentionTime)
+	if r.version >= KafkaV2 {
+		enc.EncodeInt64(r.RetentionTime)
 	}
 
-	enc.EncodeArrayLen(r.Topics)
+	enc.EncodeArrayLen(len(r.Topics))
 	for _, topic := range r.Topics {
-		enc.Encode(topic.Name)
-		enc.EncodeArrayLen(topic.Partitions)
+		enc.EncodeString(topic.Name)
+		enc.EncodeArrayLen(len(topic.Partitions))
 		for _, part := range topic.Partitions {
-			enc.Encode(part.ID)
-			enc.Encode(part.Offset)
+			enc.EncodeInt32(part.ID)
+			enc.EncodeInt64(part.Offset)
 
-			if version == KafkaV1 {
+			if r.version == KafkaV1 {
 				// TODO(husio) is this really in milliseconds?
-				enc.Encode(part.TimeStamp.UnixNano() / int64(time.Millisecond))
+				enc.EncodeInt64(part.TimeStamp.UnixNano() / int64(time.Millisecond))
 			}
 
-			enc.Encode(part.Metadata)
+			enc.EncodeString(part.Metadata)
 		}
 	}
 
@@ -1277,8 +1552,8 @@ func (r *OffsetCommitReq) Bytes(version int16) ([]byte, error) {
 	return b, nil
 }
 
-func (r *OffsetCommitReq) WriteTo(w io.Writer, version int16) (int64, error) {
-	b, err := r.Bytes(version)
+func (r *OffsetCommitReq) WriteTo(w io.Writer) (int64, error) {
+	b, err := r.Bytes()
 	if err != nil {
 		return 0, err
 	}
@@ -1287,6 +1562,7 @@ func (r *OffsetCommitReq) WriteTo(w io.Writer, version int16) (int64, error) {
 }
 
 type OffsetCommitResp struct {
+	Version       int16
 	CorrelationID int32
 	ThrottleTime  time.Duration // >= KafkaV3 only
 	Topics        []OffsetCommitRespTopic
@@ -1303,14 +1579,23 @@ type OffsetCommitRespPartition struct {
 }
 
 func ReadOffsetCommitResp(r io.Reader) (*OffsetCommitResp, error) {
+	return ReadVersionedOffsetCommitResp(r, KafkaV0)
+}
+
+func ReadVersionedOffsetCommitResp(r io.Reader, version int16) (*OffsetCommitResp, error) {
 	var resp OffsetCommitResp
+	resp.Version = version
 	dec := NewDecoder(r)
 
 	// total message size
 	_ = dec.DecodeInt32()
 	resp.CorrelationID = dec.DecodeInt32()
 
-	len, err := dec.DecodeArrayLen(false)
+	if version >= KafkaV3 {
+		resp.ThrottleTime = dec.DecodeDuration32()
+	}
+
+	len, err := dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
@@ -1320,7 +1605,7 @@ func ReadOffsetCommitResp(r io.Reader) (*OffsetCommitResp, error) {
 		var t = &resp.Topics[ti]
 		t.Name = dec.DecodeString()
 
-		len, err := dec.DecodeArrayLen(false)
+		len, err := dec.DecodeArrayLen()
 		if err != nil {
 			return nil, err
 		}
@@ -1339,24 +1624,24 @@ func ReadOffsetCommitResp(r io.Reader) (*OffsetCommitResp, error) {
 	return &resp, nil
 }
 
-func (r *OffsetCommitResp) Bytes(version int16) ([]byte, error) {
+func (r *OffsetCommitResp) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
 
 	// message size - for now just placeholder
-	enc.Encode(int32(0))
-	enc.Encode(r.CorrelationID)
+	enc.EncodeInt32(0)
+	enc.EncodeInt32(r.CorrelationID)
 
-	if version >= KafkaV3 {
-		enc.Encode(r.ThrottleTime)
+	if r.Version >= KafkaV3 {
+		enc.EncodeDuration(r.ThrottleTime)
 	}
 
-	enc.EncodeArrayLen(r.Topics)
+	enc.EncodeArrayLen(len(r.Topics))
 	for _, t := range r.Topics {
-		enc.Encode(t.Name)
-		enc.EncodeArrayLen(t.Partitions)
+		enc.EncodeString(t.Name)
+		enc.EncodeArrayLen(len(t.Partitions))
 		for _, p := range t.Partitions {
-			enc.Encode(p.ID)
+			enc.EncodeInt32(p.ID)
 			enc.EncodeError(p.Err)
 		}
 	}
@@ -1374,9 +1659,7 @@ func (r *OffsetCommitResp) Bytes(version int16) ([]byte, error) {
 }
 
 type OffsetFetchReq struct {
-	Version       int16
-	CorrelationID int32
-	ClientID      string
+	RequestHeader
 	ConsumerGroup string
 	Topics        []OffsetFetchReqTopic
 }
@@ -1390,29 +1673,20 @@ func ReadOffsetFetchReq(r io.Reader) (*OffsetFetchReq, error) {
 	var req OffsetFetchReq
 	dec := NewDecoder(r)
 
-	// total message size
-	_ = dec.DecodeInt32()
-	// api key
-	_ = dec.DecodeInt16()
-	req.Version = dec.DecodeInt16()
-	req.CorrelationID = dec.DecodeInt32()
-	req.ClientID = dec.DecodeString()
+	decodeHeader(dec, &req)
+
 	req.ConsumerGroup = dec.DecodeString()
 
-	len, err := dec.DecodeArrayLen(true) // nullable
+	len, err := dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
-	if len < 0 { // null array
-		req.Topics = nil
-	} else {
-		req.Topics = make([]OffsetFetchReqTopic, len)
-	}
+	req.Topics = make([]OffsetFetchReqTopic, len)
 
 	for ti := range req.Topics {
 		var topic = &req.Topics[ti]
 		topic.Name = dec.DecodeString()
-		len, err = dec.DecodeArrayLen(false)
+		len, err = dec.DecodeArrayLen()
 		if err != nil {
 			return nil, err
 		}
@@ -1429,25 +1703,21 @@ func ReadOffsetFetchReq(r io.Reader) (*OffsetFetchReq, error) {
 	return &req, nil
 }
 
-func (r *OffsetFetchReq) Bytes(version int16) ([]byte, error) {
+func (r OffsetFetchReq) Kind() int16 {
+	return OffsetFetchReqKind
+}
+
+func (r *OffsetFetchReq) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
 
-	// message size - for now just placeholder
-	enc.Encode(int32(0))
-	enc.Encode(int16(OffsetFetchReqKind))
-	enc.Encode(r.Version)
-	enc.Encode(r.CorrelationID)
-	enc.Encode(r.ClientID)
+	encodeHeader(enc, r)
 
-	enc.Encode(r.ConsumerGroup)
-	enc.EncodeArrayLen(r.Topics)
+	enc.EncodeString(r.ConsumerGroup)
+	enc.EncodeArrayLen(len(r.Topics))
 	for _, t := range r.Topics {
-		enc.Encode(t.Name)
-		enc.EncodeArrayLen(t.Partitions)
-		for _, p := range t.Partitions {
-			enc.Encode(p)
-		}
+		enc.EncodeString(t.Name)
+		enc.EncodeInt32s(t.Partitions)
 	}
 
 	if enc.Err() != nil {
@@ -1461,8 +1731,8 @@ func (r *OffsetFetchReq) Bytes(version int16) ([]byte, error) {
 	return b, nil
 }
 
-func (r *OffsetFetchReq) WriteTo(w io.Writer, version int16) (int64, error) {
-	b, err := r.Bytes(version)
+func (r *OffsetFetchReq) WriteTo(w io.Writer) (int64, error) {
+	b, err := r.Bytes()
 	if err != nil {
 		return 0, err
 	}
@@ -1471,6 +1741,7 @@ func (r *OffsetFetchReq) WriteTo(w io.Writer, version int16) (int64, error) {
 }
 
 type OffsetFetchResp struct {
+	Version       int16
 	CorrelationID int32
 	ThrottleTime  time.Duration // >= KafkaV3
 	Topics        []OffsetFetchRespTopic
@@ -1490,6 +1761,10 @@ type OffsetFetchRespPartition struct {
 }
 
 func ReadOffsetFetchResp(r io.Reader) (*OffsetFetchResp, error) {
+	return ReadVersionedOffsetFetchResp(r, KafkaV0)
+}
+
+func ReadVersionedOffsetFetchResp(r io.Reader, version int16) (*OffsetFetchResp, error) {
 	var resp OffsetFetchResp
 	dec := NewDecoder(r)
 
@@ -1497,7 +1772,13 @@ func ReadOffsetFetchResp(r io.Reader) (*OffsetFetchResp, error) {
 	_ = dec.DecodeInt32()
 	resp.CorrelationID = dec.DecodeInt32()
 
-	len, err := dec.DecodeArrayLen(false)
+	resp.Version = version
+
+	if version >= KafkaV3 {
+		resp.ThrottleTime = dec.DecodeDuration32()
+	}
+
+	len, err := dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
@@ -1507,7 +1788,7 @@ func ReadOffsetFetchResp(r io.Reader) (*OffsetFetchResp, error) {
 		var t = &resp.Topics[ti]
 		t.Name = dec.DecodeString()
 
-		len, err = dec.DecodeArrayLen(false)
+		len, err = dec.DecodeArrayLen()
 		if err != nil {
 			return nil, err
 		}
@@ -1522,37 +1803,41 @@ func ReadOffsetFetchResp(r io.Reader) (*OffsetFetchResp, error) {
 		}
 	}
 
+	if version >= KafkaV2 {
+		resp.Err = errFromNo(dec.DecodeInt16())
+	}
+
 	if err := dec.Err(); err != nil {
 		return nil, err
 	}
 	return &resp, nil
 }
 
-func (r *OffsetFetchResp) Bytes(version int16) ([]byte, error) {
+func (r *OffsetFetchResp) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
 
 	// message size - for now just placeholder
-	enc.Encode(int32(0))
-	enc.Encode(r.CorrelationID)
+	enc.EncodeInt32(0)
+	enc.EncodeInt32(r.CorrelationID)
 
-	if version >= KafkaV3 {
-		enc.Encode(r.ThrottleTime)
+	if r.Version >= KafkaV3 {
+		enc.EncodeDuration(r.ThrottleTime)
 	}
 
-	enc.EncodeArrayLen(r.Topics)
+	enc.EncodeArrayLen(len(r.Topics))
 	for _, topic := range r.Topics {
-		enc.Encode(topic.Name)
-		enc.EncodeArrayLen(topic.Partitions)
+		enc.EncodeString(topic.Name)
+		enc.EncodeArrayLen(len(topic.Partitions))
 		for _, part := range topic.Partitions {
-			enc.Encode(part.ID)
-			enc.Encode(part.Offset)
-			enc.Encode(part.Metadata)
+			enc.EncodeInt32(part.ID)
+			enc.EncodeInt64(part.Offset)
+			enc.EncodeString(part.Metadata)
 			enc.EncodeError(part.Err)
 		}
 	}
 
-	if version >= KafkaV2 {
+	if r.Version >= KafkaV2 {
 		enc.EncodeError(r.Err)
 	}
 
@@ -1568,9 +1853,7 @@ func (r *OffsetFetchResp) Bytes(version int16) ([]byte, error) {
 }
 
 type ProduceReq struct {
-	Version         int16
-	CorrelationID   int32
-	ClientID        string
+	RequestHeader
 	Compression     Compression // only used when sending ProduceReqs
 	TransactionalID string
 	RequiredAcks    int16
@@ -1592,22 +1875,16 @@ func ReadProduceReq(r io.Reader) (*ProduceReq, error) {
 	var req ProduceReq
 	dec := NewDecoder(r)
 
-	// total message size
-	_ = dec.DecodeInt32()
-	// api key
-	_ = dec.DecodeInt16()
-	req.Version = dec.DecodeInt16()
-	req.CorrelationID = dec.DecodeInt32()
-	req.ClientID = dec.DecodeString()
+	decodeHeader(dec, &req)
 
-	if req.Version >= KafkaV3 {
+	if req.version >= KafkaV3 {
 		req.TransactionalID = dec.DecodeString()
 	}
 
 	req.RequiredAcks = dec.DecodeInt16()
 	req.Timeout = time.Duration(dec.DecodeInt32()) * time.Millisecond
 
-	len, err := dec.DecodeArrayLen(false)
+	len, err := dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
@@ -1617,7 +1894,7 @@ func ReadProduceReq(r io.Reader) (*ProduceReq, error) {
 		var topic = &req.Topics[ti]
 		topic.Name = dec.DecodeString()
 
-		len, err = dec.DecodeArrayLen(false)
+		len, err = dec.DecodeArrayLen()
 		if err != nil {
 			return nil, err
 		}
@@ -1634,7 +1911,7 @@ func ReadProduceReq(r io.Reader) (*ProduceReq, error) {
 				return nil, dec.Err()
 			}
 			var err error
-			if part.Messages, err = readMessageSet(r, msgSetSize, req.Version); err != nil {
+			if part.Messages, err = readMessageSet(r, msgSetSize); err != nil {
 				return nil, err
 			}
 		}
@@ -1646,26 +1923,26 @@ func ReadProduceReq(r io.Reader) (*ProduceReq, error) {
 	return &req, nil
 }
 
-func (r *ProduceReq) Bytes(version int16) ([]byte, error) {
+func (r ProduceReq) Kind() int16 {
+	return ProduceReqKind
+}
+
+func (r *ProduceReq) Bytes() ([]byte, error) {
 	var buf buffer
 	enc := NewEncoder(&buf)
 
-	enc.EncodeInt32(0) // placeholder
-	enc.EncodeInt16(ProduceReqKind)
-	enc.EncodeInt16(r.Version)
-	enc.EncodeInt32(r.CorrelationID)
-	enc.EncodeString(r.ClientID)
+	encodeHeader(enc, r)
 
-	if version >= KafkaV3 {
+	if r.version >= KafkaV3 {
 		enc.EncodeString(r.TransactionalID)
 	}
 
 	enc.EncodeInt16(r.RequiredAcks)
 	enc.EncodeInt32(int32(r.Timeout / time.Millisecond))
-	enc.EncodeArrayLen(r.Topics)
+	enc.EncodeArrayLen(len(r.Topics))
 	for _, t := range r.Topics {
 		enc.EncodeString(t.Name)
-		enc.EncodeArrayLen(t.Partitions)
+		enc.EncodeArrayLen(len(t.Partitions))
 		for _, p := range t.Partitions {
 			enc.EncodeInt32(p.ID)
 			i := len(buf)
@@ -1686,8 +1963,8 @@ func (r *ProduceReq) Bytes(version int16) ([]byte, error) {
 	return []byte(buf), nil
 }
 
-func (r *ProduceReq) WriteTo(w io.Writer, version int16) (int64, error) {
-	b, err := r.Bytes(version)
+func (r *ProduceReq) WriteTo(w io.Writer) (int64, error) {
+	b, err := r.Bytes()
 	if err != nil {
 		return 0, err
 	}
@@ -1696,6 +1973,7 @@ func (r *ProduceReq) WriteTo(w io.Writer, version int16) (int64, error) {
 }
 
 type ProduceResp struct {
+	Version       int16
 	CorrelationID int32
 	Topics        []ProduceRespTopic
 	ThrottleTime  time.Duration
@@ -1713,30 +1991,30 @@ type ProduceRespPartition struct {
 	LogAppendTime int64
 }
 
-func (r *ProduceResp) Bytes(version int16) ([]byte, error) {
+func (r *ProduceResp) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
 
 	// message size - for now just placeholder
-	enc.Encode(int32(0))
-	enc.Encode(r.CorrelationID)
-	enc.EncodeArrayLen(r.Topics)
+	enc.EncodeInt32(0)
+	enc.EncodeInt32(r.CorrelationID)
+	enc.EncodeArrayLen(len(r.Topics))
 	for _, topic := range r.Topics {
-		enc.Encode(topic.Name)
-		enc.EncodeArrayLen(topic.Partitions)
+		enc.EncodeString(topic.Name)
+		enc.EncodeArrayLen(len(topic.Partitions))
 		for _, part := range topic.Partitions {
-			enc.Encode(part.ID)
+			enc.EncodeInt32(part.ID)
 			enc.EncodeError(part.Err)
-			enc.Encode(part.Offset)
+			enc.EncodeInt64(part.Offset)
 
-			if version >= KafkaV2 {
-				enc.Encode(part.LogAppendTime)
+			if r.Version >= KafkaV2 {
+				enc.EncodeInt64(part.LogAppendTime)
 			}
 		}
 	}
 
-	if version >= KafkaV1 {
-		enc.Encode(r.ThrottleTime)
+	if r.Version >= KafkaV1 {
+		enc.EncodeDuration(r.ThrottleTime)
 	}
 
 	if enc.Err() != nil {
@@ -1751,13 +2029,18 @@ func (r *ProduceResp) Bytes(version int16) ([]byte, error) {
 }
 
 func ReadProduceResp(r io.Reader) (*ProduceResp, error) {
+	return ReadVersionedProduceResp(r, KafkaV0)
+}
+
+func ReadVersionedProduceResp(r io.Reader, version int16) (*ProduceResp, error) {
 	var resp ProduceResp
 	dec := NewDecoder(r)
+	resp.Version = version
 
 	// total message size
 	_ = dec.DecodeInt32()
 	resp.CorrelationID = dec.DecodeInt32()
-	len, err := dec.DecodeArrayLen(false)
+	len, err := dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
@@ -1767,7 +2050,7 @@ func ReadProduceResp(r io.Reader) (*ProduceResp, error) {
 		var t = &resp.Topics[ti]
 		t.Name = dec.DecodeString()
 
-		len, err = dec.DecodeArrayLen(false)
+		len, err = dec.DecodeArrayLen()
 		if err != nil {
 			return nil, err
 		}
@@ -1778,7 +2061,14 @@ func ReadProduceResp(r io.Reader) (*ProduceResp, error) {
 			p.ID = dec.DecodeInt32()
 			p.Err = errFromNo(dec.DecodeInt16())
 			p.Offset = dec.DecodeInt64()
+			if resp.Version >= KafkaV2 {
+				p.LogAppendTime = dec.DecodeInt64()
+			}
 		}
+	}
+
+	if resp.Version >= KafkaV1 {
+		resp.ThrottleTime = dec.DecodeDuration32()
 	}
 
 	if err := dec.Err(); err != nil {
@@ -1788,9 +2078,7 @@ func ReadProduceResp(r io.Reader) (*ProduceResp, error) {
 }
 
 type OffsetReq struct {
-	Version        int16
-	CorrelationID  int32
-	ClientID       string
+	RequestHeader
 	ReplicaID      int32
 	IsolationLevel int8
 	Topics         []OffsetReqTopic
@@ -1815,16 +2103,16 @@ func ReadOffsetReq(r io.Reader) (*OffsetReq, error) {
 	_ = dec.DecodeInt32()
 	// api key
 	_ = dec.DecodeInt16()
-	req.Version = dec.DecodeInt16()
-	req.CorrelationID = dec.DecodeInt32()
+	req.version = dec.DecodeInt16()
+	req.correlationID = dec.DecodeInt32()
 	req.ClientID = dec.DecodeString()
 	req.ReplicaID = dec.DecodeInt32()
 
-	if req.Version >= KafkaV2 {
+	if req.version >= KafkaV2 {
 		req.IsolationLevel = dec.DecodeInt8()
 	}
 
-	len, err := dec.DecodeArrayLen(false)
+	len, err := dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
@@ -1834,7 +2122,7 @@ func ReadOffsetReq(r io.Reader) (*OffsetReq, error) {
 		var topic = &req.Topics[ti]
 		topic.Name = dec.DecodeString()
 
-		len, err = dec.DecodeArrayLen(false)
+		len, err = dec.DecodeArrayLen()
 		if err != nil {
 			return nil, err
 		}
@@ -1845,7 +2133,7 @@ func ReadOffsetReq(r io.Reader) (*OffsetReq, error) {
 			part.ID = dec.DecodeInt32()
 			part.TimeMs = dec.DecodeInt64()
 
-			if req.Version == KafkaV0 {
+			if req.version == KafkaV0 {
 				part.MaxOffsets = dec.DecodeInt32()
 			}
 		}
@@ -1857,33 +2145,33 @@ func ReadOffsetReq(r io.Reader) (*OffsetReq, error) {
 	return &req, nil
 }
 
-func (r *OffsetReq) Bytes(version int16) ([]byte, error) {
+func (r OffsetReq) Kind() int16 {
+	return OffsetReqKind
+}
+
+func (r *OffsetReq) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
 
-	// message size - for now just placeholder
-	enc.Encode(int32(0))
-	enc.Encode(int16(OffsetReqKind))
-	enc.Encode(r.Version)
-	enc.Encode(r.CorrelationID)
-	enc.Encode(r.ClientID)
+	encodeHeader(enc, r)
 
-	enc.Encode(r.ReplicaID)
+	//enc.Encode(r.ReplicaID)
+	enc.EncodeInt32(-1)
 
-	if version >= KafkaV2 {
-		enc.Encode(r.IsolationLevel)
+	if r.version >= KafkaV2 {
+		enc.EncodeInt8(r.IsolationLevel)
 	}
 
-	enc.EncodeArrayLen(r.Topics)
+	enc.EncodeArrayLen(len(r.Topics))
 	for _, topic := range r.Topics {
-		enc.Encode(topic.Name)
-		enc.EncodeArrayLen(topic.Partitions)
+		enc.EncodeString(topic.Name)
+		enc.EncodeArrayLen(len(topic.Partitions))
 		for _, part := range topic.Partitions {
-			enc.Encode(part.ID)
-			enc.Encode(part.TimeMs)
+			enc.EncodeInt32(part.ID)
+			enc.EncodeInt64(part.TimeMs)
 
-			if version == KafkaV0 {
-				enc.Encode(part.MaxOffsets)
+			if r.version == KafkaV0 {
+				enc.EncodeInt32(part.MaxOffsets)
 			}
 		}
 	}
@@ -1899,8 +2187,8 @@ func (r *OffsetReq) Bytes(version int16) ([]byte, error) {
 	return b, nil
 }
 
-func (r *OffsetReq) WriteTo(w io.Writer, version int16) (int64, error) {
-	b, err := r.Bytes(version)
+func (r *OffsetReq) WriteTo(w io.Writer) (int64, error) {
+	b, err := r.Bytes()
 	if err != nil {
 		return 0, err
 	}
@@ -1909,6 +2197,7 @@ func (r *OffsetReq) WriteTo(w io.Writer, version int16) (int64, error) {
 }
 
 type OffsetResp struct {
+	Version       int16
 	CorrelationID int32
 	ThrottleTime  time.Duration
 	Topics        []OffsetRespTopic
@@ -1923,18 +2212,27 @@ type OffsetRespPartition struct {
 	ID        int32
 	Err       error
 	TimeStamp time.Time // >= KafkaV1 only
-	Offsets   []int64
+	Offsets   []int64   // used in KafkaV0
 }
 
 func ReadOffsetResp(r io.Reader) (*OffsetResp, error) {
+	return ReadVersionedOffsetResp(r, KafkaV0)
+}
+
+func ReadVersionedOffsetResp(r io.Reader, version int16) (*OffsetResp, error) {
 	var resp OffsetResp
 	dec := NewDecoder(r)
+	resp.Version = version
 
 	// total message size
 	_ = dec.DecodeInt32()
 	resp.CorrelationID = dec.DecodeInt32()
 
-	len, err := dec.DecodeArrayLen(false)
+	if version >= KafkaV2 {
+		resp.ThrottleTime = dec.DecodeDuration32()
+	}
+
+	len, err := dec.DecodeArrayLen()
 	if err != nil {
 		return nil, err
 	}
@@ -1944,7 +2242,7 @@ func ReadOffsetResp(r io.Reader) (*OffsetResp, error) {
 		var t = &resp.Topics[ti]
 		t.Name = dec.DecodeString()
 
-		len, err = dec.DecodeArrayLen(false)
+		len, err = dec.DecodeArrayLen()
 		if err != nil {
 			return nil, err
 		}
@@ -1954,14 +2252,24 @@ func ReadOffsetResp(r io.Reader) (*OffsetResp, error) {
 			var p = &t.Partitions[pi]
 			p.ID = dec.DecodeInt32()
 			p.Err = errFromNo(dec.DecodeInt16())
-			len, err = dec.DecodeArrayLen(false)
-			if err != nil {
-				return nil, err
-			}
-			p.Offsets = make([]int64, len)
 
-			for oi := range p.Offsets {
-				p.Offsets[oi] = dec.DecodeInt64()
+			if version >= KafkaV1 {
+				p.TimeStamp = time.Unix(0, dec.DecodeInt64()*int64(time.Millisecond))
+
+				// in kafka >= KafkaV1 offset can be only one number.
+				// But for compatibility we still use slice
+				offset := dec.DecodeInt64()
+				p.Offsets = []int64{offset}
+			} else {
+				len, err = dec.DecodeArrayLen()
+				if err != nil {
+					return nil, err
+				}
+				p.Offsets = make([]int64, len)
+
+				for oi := range p.Offsets {
+					p.Offsets[oi] = dec.DecodeInt64()
+				}
 			}
 		}
 	}
@@ -1972,33 +2280,38 @@ func ReadOffsetResp(r io.Reader) (*OffsetResp, error) {
 	return &resp, nil
 }
 
-func (r *OffsetResp) Bytes(version int16) ([]byte, error) {
+func (r *OffsetResp) Bytes() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := NewEncoder(&buf)
 
 	// message size - for now just placeholder
-	enc.Encode(int32(0))
-	enc.Encode(r.CorrelationID)
+	enc.EncodeInt32(0)
+	enc.EncodeInt32(r.CorrelationID)
 
-	if version >= KafkaV2 {
-		enc.Encode(r.ThrottleTime)
+	if r.Version >= KafkaV2 {
+		enc.EncodeDuration(r.ThrottleTime)
 	}
 
-	enc.EncodeArrayLen(r.Topics)
+	enc.EncodeArrayLen(len(r.Topics))
 	for _, topic := range r.Topics {
-		enc.Encode(topic.Name)
-		enc.EncodeArrayLen(topic.Partitions)
+		enc.EncodeString(topic.Name)
+		enc.EncodeArrayLen(len(topic.Partitions))
 		for _, part := range topic.Partitions {
-			enc.Encode(part.ID)
+			enc.EncodeInt32(part.ID)
 			enc.EncodeError(part.Err)
 
-			if version >= KafkaV1 {
-				enc.Encode(part.TimeStamp.UnixNano() / int64(time.Millisecond))
-			}
+			if r.Version >= KafkaV1 {
+				enc.EncodeInt64(part.TimeStamp.UnixNano() / int64(time.Millisecond))
 
-			enc.EncodeArrayLen(part.Offsets)
-			for _, off := range part.Offsets {
-				enc.Encode(off)
+				// in kafka >= KafkaV1 offset can be only one value.
+				// In this case we use first element of slice
+				var offset int64
+				if len(part.Offsets) > 0 {
+					offset = part.Offsets[0]
+				}
+				enc.EncodeInt64(offset)
+			} else {
+				enc.EncodeInt64s(part.Offsets)
 			}
 		}
 	}
@@ -2014,9 +2327,366 @@ func (r *OffsetResp) Bytes(version int16) ([]byte, error) {
 	return b, nil
 }
 
+type ReplicaAssignment struct {
+	Partition int32
+	Replicas  []int32
+}
+type ConfigEntry struct {
+	ConfigName  string
+	ConfigValue string
+}
+
+type TopicInfo struct {
+	Topic              string
+	NumPartitions      int32
+	ReplicationFactor  int16
+	ReplicaAssignments []ReplicaAssignment
+	ConfigEntries      []ConfigEntry
+}
+
+type CreateTopicsReq struct {
+	RequestHeader
+	CreateTopicsRequests []TopicInfo
+	Timeout              time.Duration
+	ValidateOnly         bool
+}
+
+func ReadCreateTopicsReq(r io.Reader) (*CreateTopicsReq, error) {
+	var req CreateTopicsReq
+	dec := NewDecoder(r)
+
+	decodeHeader(dec, &req)
+
+	len, err := dec.DecodeArrayLen()
+	if err != nil {
+		return nil, err
+	}
+	req.CreateTopicsRequests = make([]TopicInfo, len)
+
+	for i := range req.CreateTopicsRequests {
+		ti := TopicInfo{}
+		ti.Topic = dec.DecodeString()
+		ti.NumPartitions = dec.DecodeInt32()
+		ti.ReplicationFactor = dec.DecodeInt16()
+		len, err := dec.DecodeArrayLen()
+		if err != nil {
+			return nil, err
+		}
+
+		ti.ReplicaAssignments = make([]ReplicaAssignment, len)
+		for j := range ti.ReplicaAssignments {
+			ra := ReplicaAssignment{}
+			ra.Partition = dec.DecodeInt32()
+			len, err = dec.DecodeArrayLen()
+			ra.Replicas = make([]int32, len)
+			for k := range ra.Replicas {
+				ra.Replicas[k] = dec.DecodeInt32()
+			}
+
+			ti.ReplicaAssignments[j] = ra
+		}
+		len, err = dec.DecodeArrayLen()
+		ti.ConfigEntries = make([]ConfigEntry, len)
+		for l := range ti.ConfigEntries {
+			ce := ConfigEntry{}
+			ce.ConfigName = dec.DecodeString()
+			ce.ConfigValue = dec.DecodeString()
+			ti.ConfigEntries[l] = ce
+		}
+
+		req.CreateTopicsRequests[i] = ti
+	}
+
+	req.Timeout = dec.DecodeDuration32()
+
+	if req.version >= KafkaV1 {
+		req.ValidateOnly = dec.DecodeInt8() != 0
+	}
+
+	if dec.Err() != nil {
+		return nil, dec.Err()
+	}
+	return &req, nil
+}
+
+func (r CreateTopicsReq) Kind() int16 {
+	return CreateTopicsReqKind
+}
+
+func (r *CreateTopicsReq) Bytes() ([]byte, error) {
+	var buf bytes.Buffer
+	enc := NewEncoder(&buf)
+
+	encodeHeader(enc, r)
+
+	enc.EncodeArrayLen(len(r.CreateTopicsRequests))
+	for _, topicInfo := range r.CreateTopicsRequests {
+		enc.EncodeString(topicInfo.Topic)
+		enc.EncodeInt32(topicInfo.NumPartitions)
+		enc.EncodeInt16(topicInfo.ReplicationFactor)
+		enc.EncodeArrayLen(len(topicInfo.ReplicaAssignments))
+		for _, replicaAssignment := range topicInfo.ReplicaAssignments {
+			enc.EncodeInt32(replicaAssignment.Partition)
+			enc.EncodeInt32s(replicaAssignment.Replicas)
+		}
+
+		enc.EncodeArrayLen(len(topicInfo.ConfigEntries))
+		for _, ce := range topicInfo.ConfigEntries {
+			enc.EncodeString(ce.ConfigName)
+			enc.EncodeString(ce.ConfigValue)
+		}
+	}
+
+	enc.EncodeDuration(r.Timeout)
+
+	if r.version >= KafkaV1 {
+		enc.EncodeInt8(boolToInt8(r.ValidateOnly))
+	}
+
+	if enc.Err() != nil {
+		return nil, enc.Err()
+	}
+
+	// update the message size information
+	b := buf.Bytes()
+	binary.BigEndian.PutUint32(b, uint32(len(b)-4))
+
+	return b, nil
+}
+
+func (r *CreateTopicsReq) WriteTo(w io.Writer) (int64, error) {
+	b, err := r.Bytes()
+	if err != nil {
+		return 0, err
+	}
+	n, err := w.Write(b)
+	return int64(n), err
+}
+
+type TopicError struct {
+	Topic        string
+	ErrorCode    int16
+	ErrorMessage string // >= KafkaV1
+	Err          error
+}
+
+type CreateTopicsResp struct {
+	Version       int16
+	CorrelationID int32
+	TopicErrors   []TopicError
+	ThrottleTime  time.Duration // >= KafkaV2
+}
+
+func (r *CreateTopicsResp) Bytes() ([]byte, error) {
+	var buf bytes.Buffer
+	enc := NewEncoder(&buf)
+
+	// message size - for now just placeholder
+	enc.EncodeInt32(0)
+	enc.EncodeInt32(r.CorrelationID)
+
+	if r.Version >= KafkaV2 {
+		enc.EncodeDuration(r.ThrottleTime)
+	}
+
+	enc.EncodeArrayLen(len(r.TopicErrors))
+	for _, te := range r.TopicErrors {
+		enc.EncodeString(te.Topic)
+		enc.EncodeInt16(te.ErrorCode)
+		if r.Version >= KafkaV1 {
+			enc.EncodeString(te.ErrorMessage)
+		}
+
+	}
+
+	if enc.Err() != nil {
+		return nil, enc.Err()
+	}
+
+	// update the message size information
+	b := buf.Bytes()
+	binary.BigEndian.PutUint32(b, uint32(len(b)-4))
+
+	return b, nil
+}
+
+func ReadCreateTopicsResp(r io.Reader) (*CreateTopicsResp, error) {
+	return ReadVersionedCreateTopicsResp(r, KafkaV0)
+}
+
+func ReadVersionedCreateTopicsResp(r io.Reader, version int16) (*CreateTopicsResp, error) {
+	var resp CreateTopicsResp
+	resp.Version = version
+	dec := NewDecoder(r)
+
+	// total message size
+	_ = dec.DecodeInt32()
+	resp.CorrelationID = dec.DecodeInt32()
+
+	if resp.Version >= KafkaV2 {
+		resp.ThrottleTime = dec.DecodeDuration32()
+	}
+
+	len, err := dec.DecodeArrayLen()
+	if err != nil {
+		return nil, err
+	}
+	resp.TopicErrors = make([]TopicError, len)
+
+	for i := range resp.TopicErrors {
+		var te = &resp.TopicErrors[i]
+		te.Topic = dec.DecodeString()
+		te.ErrorCode = dec.DecodeInt16()
+		if resp.Version >= KafkaV1 {
+			te.ErrorMessage = dec.DecodeString()
+		}
+		te.Err = errFromNo(te.ErrorCode)
+	}
+
+	if dec.Err() != nil {
+		return nil, dec.Err()
+	}
+	return &resp, nil
+}
+
 type buffer []byte
 
 func (b *buffer) Write(p []byte) (int, error) {
 	*b = append(*b, p...)
 	return len(p), nil
+}
+
+type APIVersionsReq struct {
+	RequestHeader
+}
+
+func ReadAPIVersionsReq(r io.Reader) (*APIVersionsReq, error) {
+	var req APIVersionsReq
+	dec := NewDecoder(r)
+
+	// total message size
+	_ = dec.DecodeInt32()
+	// api key + api version
+	_ = dec.DecodeInt32()
+	req.correlationID = dec.DecodeInt32()
+	req.ClientID = dec.DecodeString()
+
+	if dec.Err() != nil {
+		return nil, dec.Err()
+	}
+	return &req, nil
+}
+
+func (r APIVersionsReq) Kind() int16 {
+	return APIVersionsReqKind
+}
+
+func (r *APIVersionsReq) Bytes() ([]byte, error) {
+	var buf bytes.Buffer
+	enc := NewEncoder(&buf)
+
+	encodeHeader(enc, r)
+
+	if enc.Err() != nil {
+		return nil, enc.Err()
+	}
+
+	// update the message size information
+	b := buf.Bytes()
+	binary.BigEndian.PutUint32(b, uint32(len(b)-4))
+
+	return b, nil
+}
+
+func (r *APIVersionsReq) WriteTo(w io.Writer) (int64, error) {
+	b, err := r.Bytes()
+	if err != nil {
+		return 0, err
+	}
+	n, err := w.Write(b)
+	return int64(n), err
+}
+
+type APIVersionsResp struct {
+	Version       int16
+	CorrelationID int32
+	APIVersions   []SupportedVersion
+	ThrottleTime  time.Duration
+}
+
+type SupportedVersion struct {
+	APIKey     int16
+	MinVersion int16
+	MaxVersion int16
+}
+
+func (r *APIVersionsResp) Bytes() ([]byte, error) {
+	var buf bytes.Buffer
+	enc := NewEncoder(&buf)
+
+	// message size - for now just placeholder
+	enc.EncodeInt32(0)
+	enc.EncodeInt32(r.CorrelationID)
+	//error code
+	enc.EncodeInt16(0)
+	enc.EncodeArrayLen(len(r.APIVersions))
+	for _, api := range r.APIVersions {
+		enc.EncodeInt16(api.APIKey)
+		enc.EncodeInt16(api.MinVersion)
+		enc.EncodeInt16(api.MaxVersion)
+	}
+
+	if r.Version >= KafkaV1 {
+		enc.EncodeDuration(r.ThrottleTime)
+	}
+
+	if enc.Err() != nil {
+		return nil, enc.Err()
+	}
+
+	// update the message size information
+	b := buf.Bytes()
+	binary.BigEndian.PutUint32(b, uint32(len(b)-4))
+
+	return b, nil
+}
+
+func ReadAPIVersionsResp(r io.Reader) (*APIVersionsResp, error) {
+	return ReadVersionedAPIVersionsResp(r, KafkaV0)
+}
+
+func ReadVersionedAPIVersionsResp(r io.Reader, version int16) (*APIVersionsResp, error) {
+	var resp APIVersionsResp
+	resp.Version = version
+	dec := NewDecoder(r)
+
+	// total message size
+	_ = dec.DecodeInt32()
+	resp.CorrelationID = dec.DecodeInt32()
+	errcode := dec.DecodeInt16()
+	if errcode != 0 {
+		//TODO fill app error
+		return nil, fmt.Errorf("versioning error: %d", errcode)
+	}
+	len, err := dec.DecodeArrayLen()
+	if err != nil {
+		return nil, err
+	}
+
+	resp.APIVersions = make([]SupportedVersion, len)
+	for i := range resp.APIVersions {
+		api := &resp.APIVersions[i]
+		api.APIKey = dec.DecodeInt16()
+		api.MinVersion = dec.DecodeInt16()
+		api.MaxVersion = dec.DecodeInt16()
+	}
+
+	if version >= KafkaV1 {
+		resp.ThrottleTime = dec.DecodeDuration32()
+	}
+
+	if dec.Err() != nil {
+		return nil, dec.Err()
+	}
+	return &resp, nil
 }
